@@ -67,8 +67,14 @@ main{position:relative;z-index:1;max-width:1340px;margin:0 auto;padding:36px 32p
 .wfill{height:100%;border-radius:3px;transition:width 1.2s ease;}
 .wpct{width:38px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text);flex-shrink:0;}
 
-.bench-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;}
-.bench-name{font-size:10px;letter-spacing:1px;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-bottom:10px;}
+.bench-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;position:relative;}
+.bench-name{font-size:10px;letter-spacing:1px;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-bottom:10px;display:flex;align-items:center;gap:6px;}
+.bench-info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--muted);color:var(--muted);font-size:9px;font-family:-apple-system,sans-serif;cursor:help;position:relative;letter-spacing:0;font-weight:600;}
+.bench-info:hover{color:var(--gold-light);border-color:var(--gold-light);}
+.bench-info .bench-tip{visibility:hidden;opacity:0;position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:#1a1a1a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;width:260px;font-size:11.5px;line-height:1.65;color:var(--text);letter-spacing:0;font-family:-apple-system,sans-serif;text-transform:none;text-align:left;z-index:100;box-shadow:0 4px 16px rgba(0,0,0,0.4);transition:opacity 0.15s;pointer-events:none;font-weight:400;}
+.bench-info:hover .bench-tip{visibility:visible;opacity:1;}
+.bench-tip b{display:block;margin-bottom:8px;color:var(--gold-light);font-size:12px;}
+.bench-tip-formula{font-size:11px;color:var(--text);background:rgba(212,175,55,0.08);border-left:2px solid var(--gold-light);padding:8px 10px;margin:0 0 10px;display:block;font-style:italic;line-height:1.5;}
 .bench-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;}
 .bench-label{font-size:11px;color:var(--muted);}
 .bench-val{font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;}
@@ -638,10 +644,12 @@ function renderBench(d){
     {name:'S&P 500 대비',b:d.sp500Return,h:d.hyzReturn},
     {name:'벤치마크 계산 대비',b:d.benchReturn,h:d.hyzReturn},
   ];
+  const TIP=`<span class="bench-info">i<span class="bench-tip"><b>벤치마크는 어떻게 계산되나요?</b><span class="bench-tip-formula">"우리 포트폴리오와 똑같은 비중으로<br>그냥 지수에만 투자했다면?"</span>현재 포트폴리오 구성이<br>· 국내주식 40% · 미국주식 30%<br>· 원자재 20% · 현금 10% 라면,<br><br>벤치마크 수익률은<br>KOSPI 40% + S&P500 30% +<br>금·은 20% + 현금 10% 를<br>합친 가상의 수익률이에요.<br><br><span style="color:var(--muted);font-size:10px;">비중은 매매가 있을 때마다 새로 반영되고,<br>원자재는 IAU(금)·SLV(은) 보유 비율대로 섞어요.</span></span></span>`;
   document.getElementById('bench-grid').innerHTML=bs.map(b=>{
     const diff=b.h-b.b;
+    const isCalc=b.name==='벤치마크 계산 대비';
     return `<div class="bench-card">
-      <div class="bench-name">${b.name}</div>
+      <div class="bench-name">${b.name}${isCalc?TIP:''}</div>
       <div class="bench-row"><span class="bench-label">벤치마크</span><span class="bench-val" style="color:var(--muted)">${fmtP1(b.b,false)}</span></div>
       <div class="bench-row"><span class="bench-label">HY-Z</span><span class="bench-val" style="color:var(--gold-light)">${fmtP1(b.h,false)}</span></div>
       <hr class="bench-hr">
