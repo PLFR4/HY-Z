@@ -1452,17 +1452,24 @@ function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-// ─── 실시간 가격 fetcher (Naver Securities) ──────────────
+// ─── 실시간 가격 fetcher ──────────────────────────────────
+// KR 주식: Naver 증권 (portfolio.html과 동일 방식, 프록시 4개 순차 시도)
+// US ETF : Twelve Data (무료 플랜 US 심볼 지원, CORS 허용)
 const PRICE_CACHE = {};
-const PROXIES = [
+const TWELVE_KEY = 'ad2d085d55ca46f5b2c1b91983cc03a8';
+const NAVER_PROXIES = [
+  'https://api.codetabs.com/v1/proxy?quest=',   // null origin 허용, 실제 동작 확인
+  'https://corsproxy.io/?',
   'https://api.allorigins.win/raw?url=',
-  'https://corsproxy.io/?'
 ];
 var priceUpdateTimer = null;
 var holdingsReloadTimer = null;
 var renderDebounceTimer = null;
 var _holdingsAutoReloadStarted = false;
 var _currentHeatmapHoldings = null;
+var _cyclicItems = [];
+var _cyclicIndex = 0;
+var _updateGeneration = 0;
 
 const KR_RE = /^[0-9]{6}$|^[0-9]{4}[A-Z][0-9]$/;
 
@@ -1496,128 +1503,90 @@ function updateMarketStatusBadge() {
   statusEl.textContent = (icons[state]||'⚫') + ' ' + (labels[state]||state) + ' · KST ' + hm;
 }
 
+// KR 주식: Naver 증권 m.stock.naver.com → fluctuationsRatio (실시간 등락률%)
+// _t= 타임스탬프로 프록시 캐시 무효화 (어제 종가 데이터 방지)
 async function fetchNaverStockData(code) {
-  var cached = PRICE_CACHE[code];
-  if (cached && Date.now() - cached.ts < 60000) return cached.changeRate;
-
-  var apiUrl = encodeURIComponent('https://m.stock.naver.com/api/stock/' + code + '/basic');
-  for (var i = 0; i < PROXIES.length; i++) {
-    try {
-      var ctrl = new AbortController();
-      var tid = setTimeout(function(){ ctrl.abort(); }, 5000);
-      var res = await fetch(PROXIES[i] + apiUrl, { signal: ctrl.signal });
-      clearTimeout(tid);
-      if (!res.ok) continue;
-      var json = await res.json();
-      var changeRate = parseFloat(json.fluctuationsRatio);
-      if (!isNaN(changeRate)) return changeRate;
-    } catch(e) { /* timeout or network error — try next proxy */ }
-  }
-  return null;
-}
-
-async function fetchCommodityData(code) {
-  var cached = PRICE_CACHE[code];
-  if (cached && Date.now() - cached.ts < 60000) return cached.changeRate;
-
-  var yfHosts = ['https://query1.finance.yahoo.com', 'https://query2.finance.yahoo.com'];
-  for (var e = 0; e < yfHosts.length; e++) {
-    var yfUrl = encodeURIComponent(
-      yfHosts[e] + '/v8/finance/chart/' + code + '?interval=1d&range=5d'
-    );
-    for (var i = 0; i < PROXIES.length; i++) {
+  var ts = '_t=' + Date.now();
+  var endpoints = [
+    'https://m.stock.naver.com/api/stock/' + code + '/integration?' + ts,
+    'https://m.stock.naver.com/api/stock/' + code + '/price?' + ts,
+    'https://m.stock.naver.com/api/stock/' + code + '/basic?' + ts,
+  ];
+  for (var e = 0; e < endpoints.length; e++) {
+    var apiUrl = encodeURIComponent(endpoints[e]);
+    for (var pi = 0; pi < NAVER_PROXIES.length; pi++) {
       try {
         var ctrl = new AbortController();
         var tid = setTimeout(function(){ ctrl.abort(); }, 8000);
-        var res = await fetch(PROXIES[i] + yfUrl, { signal: ctrl.signal });
+        var res = await fetch(NAVER_PROXIES[pi] + apiUrl, { signal: ctrl.signal });
         clearTimeout(tid);
-        if (!res.ok) continue;
-        var txt = await res.text();
-        if (!txt || txt.trim()[0] !== '{') continue;
-        var data = JSON.parse(txt);
-        var result = data.chart && data.chart.result && data.chart.result[0];
-        if (!result) continue;
-        var meta = result.meta || {};
-
-        // 방법 1: regularMarketChangePercent 필드 직접 사용
-        if (meta.regularMarketChangePercent !== undefined && !isNaN(meta.regularMarketChangePercent)) {
-          console.info('[HY-Z] 원자재', code, '방법1:', meta.regularMarketChangePercent + '%');
-          return meta.regularMarketChangePercent;
+        if (!res.ok) { console.warn('[HY-Z] Naver HTTP', res.status, NAVER_PROXIES[pi]); continue; }
+        var d = await res.json();
+        // 1순위: fluctuationsRatio 직접 사용
+        var ratio = parseFloat(d.fluctuationsRatio);
+        if (!isNaN(ratio)) {
+          console.info('[HY-Z] Naver', code, ratio.toFixed(2) + '%');
+          return ratio;
         }
-
-        // 방법 2: regularMarketPreviousClose = 전일 공식 종가 (chartPreviousClose는 range 시작 직전 종가라 NG)
-        if (meta.regularMarketPrice && meta.regularMarketPreviousClose && meta.regularMarketPreviousClose !== 0) {
-          var pct2 = (meta.regularMarketPrice - meta.regularMarketPreviousClose) / meta.regularMarketPreviousClose * 100;
-          console.info('[HY-Z] 원자재', code, '방법2:', pct2.toFixed(2) + '%');
-          return pct2;
+        // 2순위: 현재가 ÷ 기준가로 직접 계산 (캐시 문제 우회)
+        var cur = parseFloat(d.tradePrice || d.closePrice || d.currentPrice);
+        var ref = parseFloat(d.referencePrice || d.previousClosePrice || d.basePrice);
+        if (cur > 0 && ref > 0) {
+          var pct = (cur - ref) / ref * 100;
+          console.info('[HY-Z] Naver(계산)', code, pct.toFixed(2) + '%');
+          return pct;
         }
-
-        // 방법 3: indicators 종가 배열의 마지막 두 값으로 계산
-        var q = result.indicators && result.indicators.quote && result.indicators.quote[0];
-        if (q && q.close) {
-          var closes = q.close.filter(function(c){ return c != null; });
-          if (closes.length >= 2) {
-            var pct3 = (closes[closes.length-1] - closes[closes.length-2]) / closes[closes.length-2] * 100;
-            console.info('[HY-Z] 원자재', code, '방법3:', pct3.toFixed(2) + '%');
-            return pct3;
-          }
-        }
-      } catch(ex) { /* timeout or network — try next */ }
+        console.warn('[HY-Z] Naver 등락률 추출 실패:', NAVER_PROXIES[pi], JSON.stringify(d).slice(0, 150));
+      } catch(ex) { console.warn('[HY-Z] Naver 오류:', NAVER_PROXIES[pi], ex.message); }
     }
   }
-
-  // 최종 폴백: Google Sheets "실시간 등락률" 탭
-  try {
-    var url = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID
-            + '/gviz/tq?tqx=out:json&sheet=' + encodeURIComponent('실시간 등락률');
-    var res2 = await fetch(url);
-    var text2 = await res2.text();
-    var m = text2.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)/);
-    if (m) {
-      var json2 = JSON.parse(m[1]);
-      var rows = json2.table.rows;
-      for (var j = 0; j < rows.length; j++) {
-        if (rows[j].c[0] && rows[j].c[0].v === code) return parseFloat(rows[j].c[1].v);
-      }
-    }
-  } catch(e2) {}
-
-  console.warn('[HY-Z] 원자재 fetch 최종 실패:', code);
+  console.warn('[HY-Z] KR주식 최종 실패:', code);
   return null;
 }
 
-async function fetchAllRealtimePrices(holdings) {
-  // 국내·해외 주식: 전체 완료 후 한 번만 렌더 (개별 완료 시 렌더 X)
-  // → 캐시된 종목이 먼저 돌아와 부분 표시되는 문제 방지
-  var krTasks = holdings
-    .filter(function(h){ return KR_RE.test(h.code); })
-    .map(function(h){
-      return fetchNaverStockData(h.code).then(function(rate){
-        if (rate !== null) {
-          PRICE_CACHE[h.code] = { changeRate: rate, ts: Date.now() };
-          savePriceCache();
-        }
-      });
-    });
+// US ETF: Twelve Data /quote — percent_change 직접 제공, CORS 허용
+async function fetchTwelveDataSingle(code) {
+  try {
+    var url = 'https://api.twelvedata.com/quote?symbol=' + encodeURIComponent(code) + '&apikey=' + TWELVE_KEY;
+    var ctrl = new AbortController();
+    var tid = setTimeout(function(){ ctrl.abort(); }, 12000);
+    var res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (!res.ok) { console.warn('[HY-Z] TwelveData HTTP', res.status, code); return null; }
+    var q = await res.json();
+    if (!q || q.status === 'error') { console.warn('[HY-Z] TwelveData 없음:', code, q && q.message); return null; }
+    var pct = parseFloat(q.percent_change);
+    if (isNaN(pct)) return null;
+    console.info('[HY-Z] TwelveData', code, pct.toFixed(2) + '%');
+    return pct;
+  } catch(e) {
+    console.warn('[HY-Z] TwelveData 오류:', code, e.message || e);
+    return null;
+  }
+}
 
-  // 원자재: 느린 Yahoo Finance를 기다리지 않도록 fire-and-forget
-  // → KR 주식 렌더를 막지 않고, 응답 오면 자동으로 히트맵 업데이트
-  holdings
-    .filter(function(h){ return h.type === '원자재' && h.code; })
-    .forEach(function(h){
-      fetchCommodityData(h.code).then(function(rate){
-        if (rate !== null) {
-          PRICE_CACHE[h.code] = { changeRate: rate, ts: Date.now() };
-          savePriceCache();
-          scheduleHeatmapRender(holdings);
-        }
-      }).catch(function(){});
-    });
-
-  // KR 주식 완료 후 상태 배지 업데이트 + 최종 렌더 보장
-  await Promise.allSettled(krTasks);
+// 단일 종목 fetch → 캐시 저장 → 히트맵 갱신
+async function fetchSingleHolding(h) {
+  var rate = null;
+  if (KR_RE.test(h.code)) {
+    rate = await fetchNaverStockData(h.code);
+  } else if (h.type === '원자재' && h.code) {
+    rate = await fetchTwelveDataSingle(h.code);
+  }
+  if (rate !== null) {
+    PRICE_CACHE[h.code] = { changeRate: rate, ts: Date.now() };
+    savePriceCache();
+    scheduleHeatmapRender(_currentHeatmapHoldings);
+  }
   updateMarketStatusBadge();
-  scheduleHeatmapRender(holdings);
+}
+
+// 새로고침 버튼 전용 — 현재 순환 위치 종목 즉시 fetch
+async function fetchAllRealtimePrices(holdings) {
+  if (!_cyclicItems.length) return;
+  var h = _cyclicItems[_cyclicIndex % _cyclicItems.length];
+  _cyclicIndex++;
+  await fetchSingleHolding(h);
 }
 
 function getMarketState() {
@@ -1640,10 +1609,29 @@ function getDailyChange(holding) {
 }
 
 function startRealtimePriceUpdates(holdings) {
-  if (priceUpdateTimer) { clearInterval(priceUpdateTimer); priceUpdateTimer = null; }
-  loadPriceCache();
-  fetchAllRealtimePrices(holdings);
-  priceUpdateTimer = setInterval(function(){ fetchAllRealtimePrices(holdings); }, 30000);
+  _updateGeneration++;
+  var myGen = _updateGeneration;
+  _cyclicItems = holdings.filter(function(h) {
+    return KR_RE.test(h.code) || (h.type === '원자재' && h.code);
+  });
+  _cyclicIndex = 0;
+
+  (async function() {
+    // 초기: 전체 종목 병렬 fetch → 히트맵 즉시 채움
+    if (_cyclicItems.length) {
+      await Promise.allSettled(_cyclicItems.map(function(h) { return fetchSingleHolding(h); }));
+    }
+    // 이후: 순환 루프로 계속 갱신
+    while (myGen === _updateGeneration) {
+      if (!_cyclicItems.length || document.visibilityState === 'hidden') {
+        await new Promise(function(r){ setTimeout(r, 1000); });
+        continue;
+      }
+      var h = _cyclicItems[_cyclicIndex % _cyclicItems.length];
+      _cyclicIndex++;
+      await fetchSingleHolding(h);
+    }
+  })();
 }
 
 function startHoldingsAutoReload() {
@@ -1657,17 +1645,17 @@ function startHoldingsAutoReload() {
 
 // ─── 포트폴리오 히트맵 · Squarify Treemap ───────────────
 function phmDailyColor(p) {
-  if (p === 0)  return cssVar('--phm-zero');
-  if (p >= 3)   return '#1B5E20';
-  if (p >= 2)   return '#2E7D32';
-  if (p >= 1)   return '#388E3C';
-  if (p >= 0.5) return '#66BB6A';
-  if (p > 0)    return '#81C784';
-  if (p > -0.5) return '#E57373';
-  if (p > -1)   return '#EF5350';
-  if (p > -2)   return '#E53935';
-  if (p > -3)   return '#D32F2F';
-  return '#B71C1C';
+  if (p === 0)  return '#414553';  // Finviz 중립 차콜
+  if (p >= 3)   return '#63c667';  // 선명한 밝은 초록 (최대)
+  if (p >= 2)   return '#509957';  // 중간 초록
+  if (p >= 1)   return '#457351';  // 어두운 올리브 초록
+  if (p >= 0.5) return '#435c52';  // 보간 (0~+1% 중간)
+  if (p > 0)    return '#424e53';  // 0% 근접, 살짝 초록빛
+  if (p > -0.5) return '#524652';  // 0% 근접, 살짝 붉은빛
+  if (p > -1)   return '#634750';  // 보간 (0~-1% 중간)
+  if (p > -2)   return '#84494e';  // 어두운 갈색 빨강
+  if (p > -3)   return '#b44b48';  // 중간 빨강
+  return '#e74b3e';                 // 선명한 밝은 빨강 (최대)
 }
 
 function phmCumulColor(p) {
@@ -1872,6 +1860,7 @@ function renderAll(data, live){
   renderPortfolio(data.holdings||FALLBACK.holdings);
   var heatmapHoldings = data.holdings||FALLBACK.holdings;
   _currentHeatmapHoldings = heatmapHoldings;
+  loadPriceCache();
   renderPortfolioHeatmap(heatmapHoldings);
   startRealtimePriceUpdates(heatmapHoldings);
   startHoldingsAutoReload();
@@ -1954,13 +1943,20 @@ document.getElementById('theme-toggle').addEventListener('click', function() {
   }
 });
 
-// 히트맵 즉시 새로고침 버튼
+// 히트맵 즉시 새로고침 버튼 — 가격 캐시만 강제 초기화 후 즉시 재조회
 document.getElementById('phm-refresh-btn').addEventListener('click', function() {
   var btn = this;
   btn.classList.add('spinning');
-  loadData().finally(function() {
-    setTimeout(function() { btn.classList.remove('spinning'); }, 800);
-  });
+  var holdings = _currentHeatmapHoldings;
+  if (holdings && holdings.length) {
+    fetchAllRealtimePrices(holdings).finally(function() {
+      setTimeout(function() { btn.classList.remove('spinning'); }, 500);
+    });
+  } else {
+    loadData().finally(function() {
+      setTimeout(function() { btn.classList.remove('spinning'); }, 800);
+    });
+  }
 });
 
 loadData();
