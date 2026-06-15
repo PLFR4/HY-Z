@@ -542,6 +542,65 @@ function pNum(s){
   return parseFloat(String(s).replace(/[₩$,\s%,]/g,'').trim())||0;
 }
 
+const PORTFOLIO_TYPES = ['국내주식','미국주식','원자재','원화','달러','채권'];
+const ASSET_NAME_BY_CODE = {
+  '000660':'SK하이닉스',
+  '010120':'LS ELECTRIC',
+  '005930':'삼성전자',
+  '455850':'SOL AI 반도체소부장',
+  '487240':'KODEX AI 전력핵심설비',
+  '0091P0':'TIGER 코리아원자력',
+  '456600':'TIMEFOLIO 글로벌AI',
+  '0131V0':'1Q 미국우주항공테크',
+  'IAU':'iShares Gold Trust',
+  'SLV':'iShares Silver Trust',
+};
+(FALLBACK.holdings || []).forEach(function(h){
+  if (h.code && !ASSET_NAME_BY_CODE[h.code]) ASSET_NAME_BY_CODE[h.code] = h.name;
+});
+
+function cleanStr(v){ return String(v || '').trim(); }
+function isPortfolioType(v){ return PORTFOLIO_TYPES.indexOf(cleanStr(v)) !== -1; }
+function isPctText(v){ return /^[+-]?\d+(?:[.,]\d+)?\s*%$/.test(cleanStr(v)); }
+function pPct(s){
+  var n = pNum(s);
+  return (typeof s === 'number' && Math.abs(n) > 0 && Math.abs(n) <= 1) ? n * 100 : n;
+}
+function portfolioCode(type, code){
+  code = cleanStr(code);
+  if (code) return code;
+  if (type === '달러') return 'USD';
+  if (type === '원화') return 'KRW';
+  return '';
+}
+function portfolioName(type, rawName, code, sector){
+  rawName = cleanStr(rawName);
+  code = portfolioCode(type, code);
+  if (rawName && !isPctText(rawName)) return rawName;
+  if (type === '원화') return '원화 예수금';
+  if (type === '달러') return '외화 예수금';
+  return ASSET_NAME_BY_CODE[code] || code || cleanStr(sector) || type;
+}
+function portfolioQty(type, qty){
+  qty = cleanStr(qty);
+  if (type === '원화') return '-';
+  if (!qty) return '';
+  if (type === '달러') return qty.charAt(0) === '$' ? qty : '$' + qty;
+  return /주$/.test(qty) ? qty : qty + '주';
+}
+function allocationFromHoldings(holdings){
+  var allocation = {};
+  (holdings || []).forEach(function(h){
+    if (!h || !h.type) return;
+    if (!allocation[h.type]) allocation[h.type] = 0;
+    allocation[h.type] += h.weight || 0;
+  });
+  return allocation;
+}
+function hasUsableAllocation(allocation){
+  return allocation && Object.keys(allocation).some(function(k){ return pNum(allocation[k]) > 0; });
+}
+
 function parseKorDate(s){
   if(!s) return null;
   s=s.trim();
@@ -560,17 +619,36 @@ function parsePortfolio(rows){
     hyzReturn:0,kospiReturn:0,sp500Return:0,benchReturn:0,
     hyzRecent:0,kospiRecent:0,sp500Recent:0,benchRecent:0,
     holdings:[],allocation:{}};
-  var VTYPES=['국내주식','미국주식','원자재','원화','달러'];
   for(var i=0;i<rows.length;i++){
     var r=rows[i]; if(!r) continue;
+    if(!res.updateDate){
+      var rowText = r.map(cleanStr).join(' ');
+      var dm = rowText.match(/(20\d{2})[.\-/\s]+(\d{1,2})[.\-/\s]+(\d{1,2})/);
+      if(dm) res.updateDate = dm[1]+'.'+dm[2].padStart(2,'0')+'.'+dm[3].padStart(2,'0');
+    }
     if(r[1]==='최신화'&&r[2]) res.updateDate=r[2];
-    if(VTYPES.includes(r[1])&&r[2]&&r[2]!=='비중'&&!/^[\d.,]+\s*%?$/.test(r[2].trim())){
+    var type = cleanStr(r[1]);
+    if(isPortfolioType(type)){
+      var rawCode = cleanStr(r[3]);
+      var valueKRW = pNum(r[9]);
+      var costKRW = pNum(r[8]);
+      var hasPositionData = !!rawCode || !!valueKRW || !!costKRW ||
+        (type === '달러' && !!cleanStr(r[6]));
+      var isAllocationRow = !rawCode && isPctText(r[2]) && !valueKRW && !costKRW;
+      if(hasPositionData && !isAllocationRow){
+        var code = portfolioCode(type, rawCode);
+        var sector = (type === '원화' || type === '달러') ? '-' : cleanStr(r[4]);
       res.holdings.push({
-        type:r[1],name:r[2],code:r[3]||'',sector:r[4]||'',
-        qty:r[5]?(r[1]==='달러'?(String(r[5]).startsWith('$')?r[5]:'$'+r[5]):r[5]+'주'):'',price:r[6]||'-',
-        costKRW:pNum(r[8]),valueKRW:pNum(r[9]),
-        pnl:pNum(r[10]),pnlPct:pNum(r[11]),weight:pNum(r[12]),dailyPct:pNum(r[13])||0,
+        type:type,
+        name:portfolioName(type, r[2], code, sector),
+        code:code,
+        sector:sector || '-',
+        qty:portfolioQty(type, r[5]),
+        price:cleanStr(r[6]) || '-',
+        costKRW:costKRW,valueKRW:valueKRW,
+        pnl:pNum(r[10]),pnlPct:pPct(r[11]),weight:pPct(r[12]),dailyPct:0,
       });
+      }
     }
     if(r[1]==='총자산'){
       res.totalAUM=pNum(r[2]);
@@ -583,20 +661,16 @@ function parsePortfolio(rows){
       res.sp500Recent=pNum(r[6]);res.benchRecent=pNum(r[7]);
     }
     if(r[1]==='주당가격') res.navPerShare=pNum(r[2]);
-    if(r[1]==='유형'&&r[2]==='비중'){
-      for(var j=i+1;j<i+8&&j<rows.length;j++){
+    if(r[1]==='유형'){
+      for(var j=i+1;j<i+10&&j<rows.length;j++){
         var ar=rows[j];
-        if(ar&&ar[1]&&['국내주식','미국주식','원자재','채권','달러','원화'].includes(ar[1]))
-          res.allocation[ar[1]]=pNum(ar[2]);
+        if(ar&&isPortfolioType(ar[1])&&cleanStr(ar[2]))
+          res.allocation[cleanStr(ar[1])]=pPct(ar[2]);
       }
     }
   }
-  if(Object.keys(res.allocation).length===0 && res.holdings.length>0){
-    res.holdings.forEach(function(h){
-      var key=h.type;
-      if(!res.allocation[key]) res.allocation[key]=0;
-      res.allocation[key]+=h.weight;
-    });
+  if(!hasUsableAllocation(res.allocation) && res.holdings.length>0){
+    res.allocation = allocationFromHoldings(res.holdings);
   }
   return res;
 }
@@ -1399,9 +1473,16 @@ function renderPortfolio(holdings){
   holdings = holdings.slice().sort(function(a,b){ return b.weight - a.weight; });
   const TAG={'국내주식':'<span class="tt t-dom">국내</span>','미국주식':'<span class="tt t-us">미국</span>',
     '원자재':'<span class="tt t-com">원자재</span>','달러':'<span class="tt t-usd">달러</span>','원화':'<span class="tt t-cash">원화</span>'};
-  document.querySelector('#port-table tbody').innerHTML=holdings.map(h=>`
+  const tbody = document.querySelector('#port-table tbody');
+  if(!holdings.length){
+    tbody.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:28px 0;">보유 종목 데이터가 없습니다.</td></tr>';
+    return;
+  }
+  tbody.innerHTML=holdings.map(h=>{
+    const meta = [h.code, h.sector && h.sector !== '-' ? h.sector : ''].filter(Boolean).join(' · ');
+    return `
     <tr>
-      <td><div class="an">${h.name}</div><div class="ac">${h.code}${h.sector&&h.sector!=='-'?' · '+h.sector:''}</div></td>
+      <td><div class="an">${h.name}</div>${meta?`<div class="ac">${meta}</div>`:''}</td>
       <td>${TAG[h.type]||h.type}</td>
       <td style="font-size:11px">${h.qty||'-'}</td>
       <td style="font-size:11px">${h.price||'-'}</td>
@@ -1409,7 +1490,8 @@ function renderPortfolio(holdings){
       <td class="pp ${h.pnl>0?'pos':h.pnl<0?'neg':''}">${h.pnl===0&&h.pnlPct===0?'-':(h.pnl>=0?'+':'')+fmtK(h.pnl)}</td>
       <td class="pp ${h.pnlPct>0?'pos':h.pnlPct<0?'neg':''}">${h.pnl===0&&h.pnlPct===0?'-':fmtP(h.pnlPct)}</td>
       <td>${h.weight.toFixed(1)}%</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 function renderMembers(members,memberDate,navPerShare,capitalByMember){
@@ -1456,12 +1538,17 @@ function cssVar(name) {
 // KR 주식: Naver 증권 (portfolio.html과 동일 방식, 프록시 4개 순차 시도)
 // US ETF : Twelve Data (무료 플랜 US 심볼 지원, CORS 허용)
 const PRICE_CACHE = {};
+const PRICE_CACHE_KEY = 'hyz_price_cache_v2';
+const PRICE_CACHE_TTL_MS = 18 * 60 * 60 * 1000;
 const TWELVE_KEY = 'ad2d085d55ca46f5b2c1b91983cc03a8';
 const NAVER_PROXIES = [
   'https://api.codetabs.com/v1/proxy?quest=',   // null origin 허용, 실제 동작 확인
   'https://corsproxy.io/?',
   'https://api.allorigins.win/raw?url=',
 ];
+const YAHOO_PROXY = 'https://api.allorigins.win/raw?url=';
+const YAHOO_PROXY_GET = 'https://api.allorigins.win/get?url=';
+const YAHOO_PROXY_JINA = 'https://r.jina.ai/http://';
 var priceUpdateTimer = null;
 var holdingsReloadTimer = null;
 var renderDebounceTimer = null;
@@ -1470,19 +1557,38 @@ var _currentHeatmapHoldings = null;
 var _cyclicItems = [];
 var _cyclicIndex = 0;
 var _updateGeneration = 0;
+var PRICE_INFLIGHT = {};
+var PRICE_BATCH_INFLIGHT = null;
 
 const KR_RE = /^[0-9]{6}$|^[0-9]{4}[A-Z][0-9]$/;
 
+function getKstDateKey() {
+  var kst = new Date(Date.now() + 9*3600*1000);
+  return kst.getUTCFullYear() + '-' +
+    ('0' + (kst.getUTCMonth()+1)).slice(-2) + '-' +
+    ('0' + kst.getUTCDate()).slice(-2);
+}
+
+function isFreshPriceEntry(entry) {
+  if (!entry || entry.changeRate === undefined || entry.changeRate === null) return false;
+  if (Date.now() - (entry.ts || 0) > PRICE_CACHE_TTL_MS) return false;
+  return entry.marketDate === getKstDateKey();
+}
+
 function savePriceCache() {
-  try { sessionStorage.setItem('hyz_price_cache', JSON.stringify(PRICE_CACHE)); } catch(e) {}
+  var payload = JSON.stringify(PRICE_CACHE);
+  try { localStorage.setItem(PRICE_CACHE_KEY, payload); } catch(e) {}
+  try { sessionStorage.setItem(PRICE_CACHE_KEY, payload); } catch(e) {}
 }
 function loadPriceCache() {
   try {
-    var saved = sessionStorage.getItem('hyz_price_cache');
+    var saved = localStorage.getItem(PRICE_CACHE_KEY) ||
+                sessionStorage.getItem(PRICE_CACHE_KEY) ||
+                sessionStorage.getItem('hyz_price_cache');
     if (!saved) return;
     var parsed = JSON.parse(saved);
     Object.keys(parsed).forEach(function(k) {
-      if (Date.now() - parsed[k].ts < 600000) PRICE_CACHE[k] = parsed[k];
+      if (isFreshPriceEntry(parsed[k])) PRICE_CACHE[k] = parsed[k];
     });
   } catch(e) {}
 }
@@ -1503,8 +1609,172 @@ function updateMarketStatusBadge() {
   statusEl.textContent = (icons[state]||'⚫') + ' ' + (labels[state]||state) + ' · KST ' + hm;
 }
 
+function extractYahooChangeRate(d) {
+  var result = d && d.chart && d.chart.result && d.chart.result[0];
+  if (!result) return null;
+  var closes = (((result.indicators || {}).quote || [])[0] || {}).close || [];
+  closes = closes.filter(function(v){ return typeof v === 'number' && isFinite(v) && v > 0; });
+  if (closes.length >= 2) {
+    var prev = closes[closes.length - 2];
+    var cur = closes[closes.length - 1];
+    return (cur - prev) / prev * 100;
+  }
+  var meta = result.meta || {};
+  var cur2 = parseFloat(meta.regularMarketPrice);
+  var prev2 = parseFloat(meta.previousClose || meta.chartPreviousClose);
+  if (cur2 > 0 && prev2 > 0) return (cur2 - prev2) / prev2 * 100;
+  return null;
+}
+
+function yahooCloseChangeRate(item) {
+  var closes = (item && item.close || []).filter(function(v){
+    return typeof v === 'number' && isFinite(v) && v > 0;
+  });
+  if (closes.length >= 2) {
+    var prev = closes[closes.length - 2];
+    var cur = closes[closes.length - 1];
+    return (cur - prev) / prev * 100;
+  }
+  return null;
+}
+
+async function fetchYahooJson(rawUrl, timeoutMs) {
+  timeoutMs = timeoutMs || 7000;
+  var proxyUrls = [
+    { url: YAHOO_PROXY_JINA + rawUrl.replace(/^https?:\/\//, ''), text: true },
+    { url: rawUrl, wrapped: false },
+    { url: YAHOO_PROXY_GET + encodeURIComponent(rawUrl), wrapped: true },
+    { url: YAHOO_PROXY + encodeURIComponent(rawUrl), wrapped: false },
+  ];
+  for (var p = 0; p < proxyUrls.length; p++) {
+    var ctrl = new AbortController();
+    var tid = setTimeout(function(){ ctrl.abort(); }, timeoutMs);
+    try {
+      var res = await fetch(proxyUrls[p].url, { signal: ctrl.signal });
+      if (!res.ok) continue;
+      if (proxyUrls[p].text) {
+        var text = await res.text();
+        var marker = 'Markdown Content:';
+        var idx = text.indexOf(marker);
+        if (idx >= 0) text = text.slice(idx + marker.length).trim();
+        return JSON.parse(text);
+      }
+      var json = await res.json();
+      return proxyUrls[p].wrapped ? JSON.parse(json.contents || '{}') : json;
+    } catch(e) {
+      console.warn('[HY-Z] Yahoo proxy 오류:', e.message || e);
+    } finally {
+      clearTimeout(tid);
+    }
+  }
+  return null;
+}
+
+async function fetchYahooKoreaBatch(holdings) {
+  var items = realtimePriceItems(holdings).filter(function(h){ return KR_RE.test(h.code); });
+  if (!items.length) return 0;
+  if (PRICE_BATCH_INFLIGHT) return PRICE_BATCH_INFLIGHT;
+
+  PRICE_BATCH_INFLIGHT = (async function() {
+    var codes = Array.from(new Set(items.map(function(h){ return h.code; })));
+    var symbols = codes.map(function(code) { return code + '.KS'; });
+    var rawUrl = 'https://query2.finance.yahoo.com/v8/finance/spark?symbols=' +
+      symbols.join(',') + '&range=5d&interval=1d';
+    var data = await fetchYahooJson(rawUrl, 12000);
+    if (!data) return 0;
+
+    var updated = 0;
+    codes.forEach(function(code) {
+      var item = data[code + '.KS'] || data[code + '.KQ'];
+      var rate = yahooCloseChangeRate(item);
+      if (rate !== null) {
+        PRICE_CACHE[code] = { changeRate: rate, ts: Date.now(), marketDate: getKstDateKey() };
+        updated++;
+      }
+    });
+    if (updated) {
+      savePriceCache();
+      if (_currentHeatmapHoldings) scheduleHeatmapRender(_currentHeatmapHoldings);
+      console.info('[HY-Z] Yahoo batch', updated, '개 종목 갱신');
+    }
+    return updated;
+  })();
+
+  try {
+    return await PRICE_BATCH_INFLIGHT;
+  } finally {
+    PRICE_BATCH_INFLIGHT = null;
+  }
+}
+
+async function fetchYahooKoreaStockData(code) {
+  var symbols = [code + '.KS', code + '.KQ'];
+  for (var i = 0; i < symbols.length; i++) {
+    var rawUrl = 'https://query2.finance.yahoo.com/v8/finance/chart/' +
+      encodeURIComponent(symbols[i]) + '?range=5d&interval=1d';
+    var json = await fetchYahooJson(rawUrl, 7000);
+    var rate = extractYahooChangeRate(json);
+    if (rate !== null) {
+      console.info('[HY-Z] Yahoo', symbols[i], rate.toFixed(2) + '%');
+      return rate;
+    }
+  }
+  return null;
+}
+
 // KR 주식: Naver 증권 m.stock.naver.com → fluctuationsRatio (실시간 등락률%)
 // _t= 타임스탬프로 프록시 캐시 무효화 (어제 종가 데이터 방지)
+function naverNum(v) {
+  return parseFloat(String(v || '').replace(/[,\s%원]/g, '')) || 0;
+}
+
+function extractNaverChangeRate(d) {
+  if (!d) return null;
+  var ratio = parseFloat(d.fluctuationsRatio);
+  if (!isNaN(ratio)) return ratio;
+
+  if (d.dealTrendInfos && d.dealTrendInfos.length) {
+    var latest = d.dealTrendInfos[0];
+    var close = naverNum(latest.closePrice);
+    var diff = naverNum(latest.compareToPreviousClosePrice);
+    var prev = close - diff;
+    if (close > 0 && prev > 0) return diff / prev * 100;
+  }
+
+  var cur = parseFloat(d.tradePrice || d.closePrice || d.currentPrice);
+  var ref = parseFloat(d.referencePrice || d.previousClosePrice || d.basePrice);
+  if (cur > 0 && ref > 0) return (cur - ref) / ref * 100;
+  return null;
+}
+
+async function fetchNaverDirect(endpoint) {
+  var ctrl = new AbortController();
+  var tid = setTimeout(function(){ ctrl.abort(); }, 2500);
+  try {
+    var res = await fetch(endpoint, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var rate = extractNaverChangeRate(await res.json());
+    if (rate === null) throw new Error('no change rate');
+    return rate;
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
+async function fetchNaverViaProxy(proxy, endpoint) {
+  var ctrl = new AbortController();
+  var tid = setTimeout(function(){ ctrl.abort(); }, 3500);
+  try {
+    var res = await fetch(proxy + encodeURIComponent(endpoint), { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var rate = extractNaverChangeRate(await res.json());
+    if (rate === null) throw new Error('no change rate');
+    return rate;
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
 async function fetchNaverStockData(code) {
   var ts = '_t=' + Date.now();
   var endpoints = [
@@ -1512,32 +1782,23 @@ async function fetchNaverStockData(code) {
     'https://m.stock.naver.com/api/stock/' + code + '/price?' + ts,
     'https://m.stock.naver.com/api/stock/' + code + '/basic?' + ts,
   ];
+  try {
+    var directRate = await Promise.any(endpoints.map(fetchNaverDirect));
+    console.info('[HY-Z] Naver direct', code, directRate.toFixed(2) + '%');
+    return directRate;
+  } catch(ex) {
+    console.warn('[HY-Z] Naver direct 실패:', code);
+  }
+
   for (var e = 0; e < endpoints.length; e++) {
-    var apiUrl = encodeURIComponent(endpoints[e]);
-    for (var pi = 0; pi < NAVER_PROXIES.length; pi++) {
-      try {
-        var ctrl = new AbortController();
-        var tid = setTimeout(function(){ ctrl.abort(); }, 8000);
-        var res = await fetch(NAVER_PROXIES[pi] + apiUrl, { signal: ctrl.signal });
-        clearTimeout(tid);
-        if (!res.ok) { console.warn('[HY-Z] Naver HTTP', res.status, NAVER_PROXIES[pi]); continue; }
-        var d = await res.json();
-        // 1순위: fluctuationsRatio 직접 사용
-        var ratio = parseFloat(d.fluctuationsRatio);
-        if (!isNaN(ratio)) {
-          console.info('[HY-Z] Naver', code, ratio.toFixed(2) + '%');
-          return ratio;
-        }
-        // 2순위: 현재가 ÷ 기준가로 직접 계산 (캐시 문제 우회)
-        var cur = parseFloat(d.tradePrice || d.closePrice || d.currentPrice);
-        var ref = parseFloat(d.referencePrice || d.previousClosePrice || d.basePrice);
-        if (cur > 0 && ref > 0) {
-          var pct = (cur - ref) / ref * 100;
-          console.info('[HY-Z] Naver(계산)', code, pct.toFixed(2) + '%');
-          return pct;
-        }
-        console.warn('[HY-Z] Naver 등락률 추출 실패:', NAVER_PROXIES[pi], JSON.stringify(d).slice(0, 150));
-      } catch(ex) { console.warn('[HY-Z] Naver 오류:', NAVER_PROXIES[pi], ex.message); }
+    try {
+      var rate = await Promise.any(NAVER_PROXIES.map(function(proxy) {
+        return fetchNaverViaProxy(proxy, endpoints[e]);
+      }));
+      console.info('[HY-Z] Naver', code, rate.toFixed(2) + '%');
+      return rate;
+    } catch(ex) {
+      console.warn('[HY-Z] Naver endpoint 실패:', code, e + 1);
     }
   }
   console.warn('[HY-Z] KR주식 최종 실패:', code);
@@ -1566,19 +1827,46 @@ async function fetchTwelveDataSingle(code) {
 }
 
 // 단일 종목 fetch → 캐시 저장 → 히트맵 갱신
+function realtimePriceItems(holdings) {
+  return (holdings || []).filter(function(h) {
+    return KR_RE.test(h.code) || (h.type === '원자재' && h.code);
+  });
+}
+
 async function fetchSingleHolding(h) {
+  if (!h || !h.code) return null;
+  if (PRICE_INFLIGHT[h.code]) return PRICE_INFLIGHT[h.code];
+  PRICE_INFLIGHT[h.code] = (async function() {
   var rate = null;
   if (KR_RE.test(h.code)) {
-    rate = await fetchNaverStockData(h.code);
+    rate = await fetchYahooKoreaStockData(h.code);
   } else if (h.type === '원자재' && h.code) {
     rate = await fetchTwelveDataSingle(h.code);
   }
   if (rate !== null) {
-    PRICE_CACHE[h.code] = { changeRate: rate, ts: Date.now() };
+    PRICE_CACHE[h.code] = { changeRate: rate, ts: Date.now(), marketDate: getKstDateKey() };
     savePriceCache();
-    scheduleHeatmapRender(_currentHeatmapHoldings);
+    if (_currentHeatmapHoldings) scheduleHeatmapRender(_currentHeatmapHoldings);
   }
   updateMarketStatusBadge();
+  return rate;
+  })();
+  try {
+    return await PRICE_INFLIGHT[h.code];
+  } finally {
+    delete PRICE_INFLIGHT[h.code];
+  }
+}
+
+function warmRealtimePriceCache(holdings) {
+  var items = realtimePriceItems(holdings);
+  if (!items.length) return Promise.resolve();
+  return fetchYahooKoreaBatch(items).then(function() {
+    var missing = items.filter(function(h) {
+      return !KR_RE.test(h.code) || !isFreshPriceEntry(PRICE_CACHE[h.code]);
+    });
+    return Promise.allSettled(missing.map(function(h) { return fetchSingleHolding(h); }));
+  });
 }
 
 // 새로고침 버튼 전용 — 현재 순환 위치 종목 즉시 fetch
@@ -1604,22 +1892,20 @@ function getDailyChange(holding) {
   var state = getMarketState();
   if (state === 'reset') return 0;
   var cached = PRICE_CACHE[holding.code];
-  if (cached) return cached.changeRate;
-  return 0;
+  if (isFreshPriceEntry(cached)) return cached.changeRate;
+  return holding.dailyPct || 0;
 }
 
 function startRealtimePriceUpdates(holdings) {
   _updateGeneration++;
   var myGen = _updateGeneration;
-  _cyclicItems = holdings.filter(function(h) {
-    return KR_RE.test(h.code) || (h.type === '원자재' && h.code);
-  });
+  _cyclicItems = realtimePriceItems(holdings);
   _cyclicIndex = 0;
 
   (async function() {
-    // 초기: 전체 종목 병렬 fetch → 히트맵 즉시 채움
+    // 초기: 배치 fetch → 히트맵 즉시 채움
     if (_cyclicItems.length) {
-      await Promise.allSettled(_cyclicItems.map(function(h) { return fetchSingleHolding(h); }));
+      await warmRealtimePriceCache(_cyclicItems);
     }
     // 이후: 순환 루프로 계속 갱신
     while (myGen === _updateGeneration) {
@@ -1630,6 +1916,7 @@ function startRealtimePriceUpdates(holdings) {
       var h = _cyclicItems[_cyclicIndex % _cyclicItems.length];
       _cyclicIndex++;
       await fetchSingleHolding(h);
+      await new Promise(function(r){ setTimeout(r, 60000); });
     }
   })();
 }
@@ -1838,6 +2125,18 @@ function setStatus(live){
 }
 
 function renderAll(data, live){
+  var holdings = (data.holdings && data.holdings.length) ? data.holdings : FALLBACK.holdings;
+  var allocation = hasUsableAllocation(data.allocation) ? data.allocation : allocationFromHoldings(holdings);
+  if(!hasUsableAllocation(allocation)) allocation = FALLBACK.allocation;
+  var returns = (data.returns && data.returns.length) ? data.returns : FALLBACK.returns;
+  var members = (data.members && data.members.length) ? data.members : FALLBACK.members;
+  data = Object.assign({}, data, {
+    holdings: holdings,
+    allocation: allocation,
+    returns: returns,
+    members: members,
+  });
+
   document.getElementById('hdr-updated').textContent=
     data.updateDate?'최신화 '+data.updateDate:'';
 
@@ -1849,22 +2148,22 @@ function renderAll(data, live){
     sp500Hist:  data.sp500Hist  || FALLBACK.sp500Hist  || [],
     benchHist:  data.benchHist  || FALLBACK.benchHist  || [],
     usdkrwHist: data.usdkrwHist || FALLBACK.usdkrwHist || [],
-    allocation: data.allocation || FALLBACK.allocation,
+    allocation: allocation,
   };
 
   renderKPIs(data);
   renderCompareChart();
-  renderDonut(data.allocation||FALLBACK.allocation);
+  renderDonut(allocation);
   renderBench(data);
-  renderHeatmap(data.returns || FALLBACK.returns);
-  renderPortfolio(data.holdings||FALLBACK.holdings);
-  var heatmapHoldings = (data.holdings||FALLBACK.holdings).filter(function(h){ return h.type !== '달러' && h.type !== '원화'; });
+  renderHeatmap(returns);
+  renderPortfolio(holdings);
+  var heatmapHoldings = holdings.filter(function(h){ return h.type !== '달러' && h.type !== '원화'; });
   _currentHeatmapHoldings = heatmapHoldings;
   loadPriceCache();
   renderPortfolioHeatmap(heatmapHoldings);
   startRealtimePriceUpdates(heatmapHoldings);
   startHoldingsAutoReload();
-  renderMembers(data.members||FALLBACK.members, data.memberDate||FALLBACK.memberDate, data.navPerShare||FALLBACK.navPerShare, data.capitalByMember||{});
+  renderMembers(members, data.memberDate||FALLBACK.memberDate, data.navPerShare||FALLBACK.navPerShare, data.capitalByMember||{});
   setStatus(live);
   document.getElementById('loading').style.display='none';
 }
@@ -1878,6 +2177,11 @@ async function loadData(){
       gvizFetch(SHEETS.members),
     ]);
     const portData=parsePortfolio(portRows);
+    const priceWarmup = warmRealtimePriceCache(portData.holdings);
+    await Promise.race([
+      priceWarmup,
+      new Promise(function(resolve){ setTimeout(resolve, 3000); })
+    ]).catch(function(e){ console.warn('[HY-Z] 초기 가격 선조회 실패:', e); });
     const returns=parseReturns(retRows);
     const{members,memberDate}=parseMembers(memRows);
 
@@ -1910,6 +2214,11 @@ async function loadData(){
       capitalByMember=parseCapital(capRows);
       console.info('[HY-Z] 자본변동내역 로드 완료. 매칭 인원:',Object.keys(capitalByMember).length);
     }catch(ce){ console.warn('[HY-Z] 자본변동내역 시트 로딩 실패:',ce); }
+
+    await Promise.race([
+      priceWarmup,
+      new Promise(function(resolve){ setTimeout(resolve, 1000); })
+    ]).catch(function(e){ console.warn('[HY-Z] 초기 가격 프리로드 실패:', e); });
 
     const data={
       ...FALLBACK,...portData,
