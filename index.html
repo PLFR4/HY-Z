@@ -858,63 +858,133 @@ function parseIndexHistoryByHeader(rows, dateHeaderPattern, label){
   return dedup;
 }
 
-// 자본변동내역 파싱 (기존 로직 유지)
+// 자본변동내역 파싱
+// 불출액 전체를 원금에서 빼지 않고, 불출 좌수 × 해당 주주의 이동평균 취득원가만 차감한다.
+// 예: 20좌를 좌당 1만원에 취득 후 9좌를 좌당 2만원에 불출하면
+//     잔여 원금은 11만원, 잔여 평가액 22만원 기준 손익은 11만원이다.
 function parseCapital(rows){
-  var EXCLUDE=['합계','총계','총','기준일','비고','항목','내역','누적','변동','날짜','일자','구분','계','기여액','주주','이름','성명','주주명','입금','출금','자본금','납입','불출'];
-  var out={};
-  var amtCol=-1, headerRow=-1, nameCol=-1;
-  outer:
+  var tx=[];
+  var col={date:-1,type:-1,deposit:-1,withdraw:-1,name:-1,units:-1};
+  var headerRow=-1;
+
+  function textAt(row,idx){
+    return idx>=0 && row && row[idx]!==undefined && row[idx]!==null
+      ? String(row[idx]).trim() : '';
+  }
+  function normalized(s){ return String(s||'').replace(/\s+/g,''); }
+  function parseUnits(s){
+    var m=String(s||'').replace(/,/g,'').match(/([\d.]+)\s*(?:주|좌)/);
+    return m ? (parseFloat(m[1])||0) : 0;
+  }
+
+  // 실제 거래표 헤더(일자/내역/입금/출금/주주)를 찾는다.
   for(var i=0;i<rows.length;i++){
     var r=rows[i]; if(!r) continue;
+    var found={};
     for(var c=0;c<r.length;c++){
-      var v=(r[c]||'').toString().trim();
-      if(!v) continue;
-      if(v.indexOf('자본금 기여액')>=0 || v.indexOf('자본금기여액')>=0 || v==='기여액'){
-        amtCol=c; headerRow=i;
-        for(var c2=c-1;c2>=0;c2--){
-          var v2=(r[c2]||'').toString().trim();
-          if(v2==='주주'||v2==='이름'||v2==='성명'||v2==='주주명'){ nameCol=c2; break; }
+      var h=normalized(r[c]);
+      if(h==='일자'||h==='날짜') found.date=c;
+      else if(h==='내역'||h==='구분') found.type=c;
+      else if(h==='입금') found.deposit=c;
+      else if(h==='출금') found.withdraw=c;
+      else if(h.indexOf('주주')===0 || h==='이름' || h==='성명') found.name=c;
+    }
+    if(found.type!==undefined && found.deposit!==undefined &&
+       found.withdraw!==undefined && found.name!==undefined){
+      col.date=found.date===undefined?Math.max(0,found.type-1):found.date;
+      col.type=found.type; col.deposit=found.deposit;
+      col.withdraw=found.withdraw; col.name=found.name;
+      col.units=found.name+1; // 현재 시트에서 좌수는 주주 바로 다음 열
+      headerRow=i; break;
+    }
+  }
+  if(headerRow<0) return {};
+
+  var lastDate='';
+  for(var j=headerRow+1;j<rows.length;j++){
+    var row=rows[j]; if(!row) continue;
+    var kind=normalized(textAt(row,col.type));
+    var isDeposit=kind.indexOf('납입')>=0;
+    var isWithdraw=kind.indexOf('불출')>=0;
+    if(!isDeposit && !isWithdraw) continue;
+    var name=textAt(row,col.name);
+    var amount=isDeposit?pNum(row[col.deposit]):pNum(row[col.withdraw]);
+    if(!name || amount<=0) continue;
+    var parsedDate=parseKorDate(textAt(row,col.date));
+    if(parsedDate) lastDate=parsedDate;
+    tx.push({
+      date:parsedDate||lastDate||('row-'+j),
+      row:j,
+      type:isDeposit?'deposit':'withdraw',
+      name:name,
+      amount:amount,
+      units:parseUnits(textAt(row,col.units))
+    });
+  }
+
+  // 같은 날짜에 좌수가 적힌 행이 있으면 그 날의 좌당 가격을 우선 사용한다.
+  // 초기 행처럼 좌수가 모두 비어 있으면 금액들을 가장 잘 나누는 좌당 가격을 추정한다.
+  var groups={};
+  tx.forEach(function(t){ (groups[t.date]||(groups[t.date]=[])).push(t); });
+  var lastUnitPrice=INCEPTION_NAV;
+  Object.keys(groups).forEach(function(date){
+    var list=groups[date];
+    var explicit=list.filter(function(t){return t.units>0;});
+    var unitPrice=0;
+    if(explicit.length){
+      var weightedAmount=explicit.reduce(function(s,t){return s+t.amount;},0);
+      var weightedUnits=explicit.reduce(function(s,t){return s+t.units;},0);
+      unitPrice=weightedUnits>0?weightedAmount/weightedUnits:0;
+    }else{
+      var candidates={};
+      list.forEach(function(t){
+        for(var n=1;n<=100;n++){
+          var p=Math.round((t.amount/n)/100)*100;
+          if(p>=8000 && p<=100000) candidates[p]=true;
         }
-        if(nameCol<0 && c>0) nameCol=c-1;
-        break outer;
-      }
+      });
+      var bestScore=-1, bestDistance=Infinity;
+      Object.keys(candidates).forEach(function(key){
+        var p=Number(key), score=0;
+        list.forEach(function(t){
+          var q=t.amount/p;
+          if(Math.abs(q-Math.round(q))<0.0001) score++;
+        });
+        var distance=Math.abs(p-lastUnitPrice);
+        if(score>bestScore || (score===bestScore && distance<bestDistance)){
+          unitPrice=p; bestScore=score; bestDistance=distance;
+        }
+      });
     }
-  }
-  if(amtCol>=0){
-    if(nameCol<0) return out;
-    for(var i2=headerRow+1;i2<rows.length;i2++){
-      var r2=rows[i2]; if(!r2) continue;
-      var nv=(r2[nameCol]||'').toString().trim();
-      if(!nv) continue;
-      if(isExcluded(nv,EXCLUDE)) continue;
-      if(!/[가-힣A-Za-z]/.test(nv)) continue;
-      if(nv.length>15) continue;
-      var amt=pNum(r2[amtCol]);
-      if(amt<=0) continue;
-      out[nv]=amt;
+    if(!(unitPrice>0)) unitPrice=lastUnitPrice;
+    list.forEach(function(t){
+      if(!(t.units>0)) t.units=Math.max(1,Math.round(t.amount/unitPrice));
+    });
+    lastUnitPrice=unitPrice;
+  });
+
+  // 주주별 이동평균 원가 장부
+  var ledger={};
+  tx.sort(function(a,b){return a.row-b.row;}).forEach(function(t){
+    var a=ledger[t.name]||(ledger[t.name]={units:0,cost:0});
+    if(t.type==='deposit'){
+      a.cost+=t.amount;
+      a.units+=t.units;
+      return;
     }
-    return out;
-  }
-  // Fallback
-  for(var i3=0;i3<rows.length;i3++){
-    var r3=rows[i3]; if(!r3) continue;
-    var nameIdx=-1, nameVal=null;
-    for(var c4=0;c4<r3.length;c4++){
-      var v4=(r3[c4]||'').toString().trim();
-      if(!v4) continue;
-      if(/^[\d,.\s₩$%\-+()]+$/.test(v4)) continue;
-      if(/\d{2,4}[-./]\d{1,2}/.test(v4)) continue;
-      if(isExcluded(v4,EXCLUDE)) continue;
-      if(/[가-힣A-Za-z]/.test(v4) && v4.length<=15){ nameIdx=c4; nameVal=v4; break; }
-    }
-    if(nameIdx<0) continue;
-    var amount=0;
-    for(var c5=nameIdx+1;c5<r3.length;c5++){
-      var n5=pNum(r3[c5]);
-      if(n5>=1000 && n5>amount) amount=n5;
-    }
-    if(amount>0) out[nameVal]=(out[nameVal]||0)+amount;
-  }
+    if(a.units<=0) return;
+    var sold=Math.min(t.units,a.units);
+    a.cost-=(a.cost/a.units)*sold;
+    a.units-=sold;
+    if(a.units<0.000001){ a.units=0; a.cost=0; }
+  });
+
+  var out={};
+  Object.keys(ledger).forEach(function(name){
+    if(ledger[name].units>0 && ledger[name].cost>0)
+      out[name]=Math.round(ledger[name].cost);
+  });
+  console.info('[HY-Z] 주 단위 원가 장부 계산 완료:',out);
   return out;
 }
 function isExcluded(s,list){
